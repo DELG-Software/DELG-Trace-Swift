@@ -11,6 +11,7 @@ let package = Package(
         .library(name: "DELGTrace", targets: ["DELGTrace"])
     ],
     targets: [
-        .target(name: "DELGTrace", path: "Sources/DELGTrace")
+        .target(name: "DELGTrace"),
+        .testTarget(name: "DELGTraceTests", dependencies: ["DELGTrace"])
     ]
 )

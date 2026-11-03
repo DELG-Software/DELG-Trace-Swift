@@ -7,7 +7,7 @@ import Foundation
 /// URLSession sends them asynchronously. This client does not install crash handlers.
 public final class TraceClient: NSObject {
     public static let defaultEndpoint = "https://api.delg.dev/trace"
-    private static let sdkVersion = "swift/0.1.0"
+    private static let sdkVersion = "swift/0.2.0"
     private static let maxQueueEvents = 1_000
     private static let maxQueueBytes = 8 * 1_024 * 1_024
     private static let maxEventBytes = 64 * 1_024
@@ -22,6 +22,9 @@ public final class TraceClient: NSObject {
     private let queueURL: URL?
     private let configuredIngestURL: String
     private let encoder: JSONEncoder
+    private let diagnosticState = TraceDiagnosticState()
+    private let sessionLock = NSLock()
+    private var activeSession: ActiveSession?
     private var records: [QueuedEvent] = []
     private var queueBytes = 0
     private var breadcrumbs: [[String: Any]] = []
@@ -64,6 +67,7 @@ public final class TraceClient: NSObject {
             queueBytes = records.reduce(0) { $0 + $1.event.count }
             persistQueue()
         }
+        diagnosticState.setQueueSize(records.count)
 
         let interval = max(0, options.automaticFlushInterval)
         if interval > 0 {
@@ -91,6 +95,9 @@ public final class TraceClient: NSObject {
     /// Whether this instance has a non-empty token and valid HTTP(S) ingest endpoint.
     @objc public var isEnabled: Bool { enabledValue }
 
+    /// Current local queue and delivery counters. No event contents are exposed.
+    public func diagnosticsSnapshot() -> TraceDiagnosticsSnapshot { diagnosticState.snapshot() }
+
     /// Captures a caller supplied Swift error. The stack is captured at the call site, on that thread.
     public func capture(
         error: Error,
@@ -106,6 +113,25 @@ public final class TraceClient: NSObject {
         let exceptions = Self.exceptionPayloads(for: error, frames: frames)
         var event = errorEvent(level: level, extraTags: extraTags, extraContexts: extraContexts, span: span, userHash: userHash, fingerprint: fingerprint)
         event["exceptions"] = exceptions
+        if let erroredSession = markActiveSessionErrored() { enqueueWithState(erroredSession) }
+        enqueueWithState(event)
+    }
+
+    /// Captures an error with caller-supplied frames, including optional native debug identity.
+    public func capture(
+        error: Error,
+        frames: [TraceFrame],
+        level: String = "error",
+        tags extraTags: [String: String] = [:],
+        contexts extraContexts: [String: [String: String]] = [:],
+        span: TraceSpan? = nil,
+        userHash: String? = nil,
+        fingerprint: [String]? = nil
+    ) {
+        guard enabledValue else { return }
+        var event = errorEvent(level: level, extraTags: extraTags, extraContexts: extraContexts, span: span, userHash: userHash, fingerprint: fingerprint)
+        event["exceptions"] = Self.exceptionPayloads(for: error, frames: frames.map(\.payload))
+        if let erroredSession = markActiveSessionErrored() { enqueueWithState(erroredSession) }
         enqueueWithState(event)
     }
 
@@ -128,6 +154,9 @@ public final class TraceClient: NSObject {
         guard enabledValue else { return }
         var event = errorEvent(level: level, extraTags: extraTags, extraContexts: extraContexts, span: span, userHash: userHash, fingerprint: fingerprint)
         event["message"] = String(message.prefix(4_000))
+        if ["error", "fatal"].contains(event["level"] as? String), let erroredSession = markActiveSessionErrored() {
+            enqueueWithState(erroredSession)
+        }
         enqueueWithState(event)
     }
 
@@ -202,6 +231,37 @@ public final class TraceClient: NSObject {
                 self.contexts.removeValue(forKey: name)
             }
         }
+    }
+
+    /// Starts an explicit release-health session. Repeated starts return the active SID.
+    /// A clean session is recorded only by endSession; unfinished sessions are not counted as crash-free.
+    public func startSession() -> String? {
+        guard enabledValue else { return nil }
+        sessionLock.lock(); defer { sessionLock.unlock() }
+        if let activeSession { return activeSession.sid }
+        let session = ActiveSession(sid: Self.randomID(bytes: 16), start: Self.timestamp(), errored: false)
+        activeSession = session
+        return session.sid
+    }
+
+    /// Resends an errored active session. A clean session stays pending until endSession.
+    @discardableResult
+    public func updateSession() -> Bool {
+        guard enabledValue else { return false }
+        sessionLock.lock(); let session = activeSession; sessionLock.unlock()
+        guard let session else { return false }
+        if session.errored { enqueueWithState(session.payload) }
+        return true
+    }
+
+    /// Finalizes the active session as clean or errored and clears it. Repeated ends are no-ops.
+    @discardableResult
+    public func endSession() -> Bool {
+        guard enabledValue else { return false }
+        sessionLock.lock(); let session = activeSession; activeSession = nil; sessionLock.unlock()
+        guard let session else { return false }
+        if !session.errored { enqueueWithState(session.payload) }
+        return true
     }
 
     /// Starts a manual span, optionally as a child of another span.
@@ -313,14 +373,29 @@ public final class TraceClient: NSObject {
                 for (key, value) in (event["contexts"] as? [String: [String: String]] ?? [:]) { mergedContexts[key] = Self.boundedAttributes(value) }
                 if !mergedContexts.isEmpty { event["contexts"] = Self.boundedContexts(mergedContexts) }
             }
-            guard self.applyBeforeSend(&event),
-                  let type = event["type"] as? String,
-                  ["error", "span", "log"].contains(type),
-                  JSONSerialization.isValidJSONObject(event),
-                  let data = try? JSONSerialization.data(withJSONObject: event, options: [.sortedKeys]),
-                  data.count <= Self.maxEventBytes,
-                  self.records.count < Self.maxQueueEvents,
-                  self.queueBytes + data.count <= Self.maxQueueBytes else { return }
+            guard let type = event["type"] as? String, ["error", "span", "log", "session"].contains(type) else {
+                self.recordDiagnostic("dropped", reason: "unsupported_type")
+                return
+            }
+            guard self.applyBeforeSend(&event) else {
+                self.recordDiagnostic("before_send", reason: "filtered")
+                self.recordDiagnostic("dropped", reason: "before_send")
+                return
+            }
+            guard JSONSerialization.isValidJSONObject(event),
+                  let data = try? JSONSerialization.data(withJSONObject: event, options: [.sortedKeys]) else {
+                self.recordDiagnostic("dropped", reason: "serialization_error")
+                return
+            }
+            guard data.count <= Self.maxEventBytes else {
+                self.recordDiagnostic("dropped", reason: "event_too_large")
+                return
+            }
+            guard self.records.count < Self.maxQueueEvents, self.queueBytes + data.count <= Self.maxQueueBytes else {
+                self.recordDiagnostic("queue_full", reason: "queue_full")
+                self.recordDiagnostic("dropped", reason: "queue_full")
+                return
+            }
 
             let header = IngestHeader(
                 sdk: Self.sdkVersion,
@@ -331,6 +406,8 @@ public final class TraceClient: NSObject {
             let endpoint = self.configuredIngestURL
             self.records.append(QueuedEvent(event: data, header: header, endpoint: endpoint))
             self.queueBytes += data.count
+            self.diagnosticState.setQueueSize(self.records.count)
+            self.recordDiagnostic("queued")
             self.persistQueue()
             if self.records.count >= Self.maxBatchEvents {
                 self.pump()
@@ -370,6 +447,25 @@ public final class TraceClient: NSObject {
     private func applyBeforeSend(_ event: inout [String: Any]) -> Bool {
         guard let beforeSend = options.beforeSend else { return true }
         return beforeSend(&event)
+    }
+
+    private func markActiveSessionErrored() -> [String: Any]? {
+        sessionLock.lock(); defer { sessionLock.unlock() }
+        guard var session = activeSession, !session.errored else { return nil }
+        session.errored = true
+        activeSession = session
+        return session.payload
+    }
+
+    private func recordDiagnostic(_ outcome: String, reason: String = "", count: Int = 1, status: Int = 0) {
+        diagnosticState.increment(outcome, by: count, status: status)
+        diagnosticState.setQueueSize(records.count)
+        guard let callback = options.onDiagnostic else { return }
+        do {
+            try callback(TraceDiagnostic(outcome: outcome, reason: reason, count: count, queueSize: records.count, httpStatus: status))
+        } catch {
+            diagnosticState.increment("callback_failure")
+        }
     }
 
     private static func ingestURL(for baseEndpoint: String) -> String {
@@ -435,7 +531,7 @@ public final class TraceClient: NSObject {
         request.setValue(options.token, forHTTPHeaderField: "X-Trace-Token")
         request.httpBody = batch.body
 
-        let task = transportSession.dataTask(with: request) { [weak self] _, response, error in
+        let task = transportSession.dataTask(with: request) { [weak self] data, response, error in
             guard let self else { return }
             self.stateQueue.async {
                 self.activeTask = nil
@@ -444,17 +540,22 @@ public final class TraceClient: NSObject {
                 if status == 429 {
                     let wait = Self.retryAfter((response as? HTTPURLResponse)?.value(forHTTPHeaderField: "Retry-After"))
                     self.pausedUntil = Date().addingTimeInterval(wait)
+                    self.recordDiagnostic("retry", reason: "rate_limited", count: batch.count, status: status ?? 429)
                     self.sending = false
                     self.schedulePump(after: wait)
                     self.finishWaitersIfDrained()
                     return
                 }
                 if error != nil || status == nil || status! >= 500 {
+                    if error != nil || status == nil {
+                        self.recordDiagnostic("network", reason: "request_failed")
+                    }
                     if self.disposed {
                         self.sending = false
                         return
                     }
                     if attempt < 2 {
+                        self.recordDiagnostic("retry", reason: status == nil ? "network_failure" : "server_error", count: batch.count, status: status ?? 0)
                         let delay = Double((attempt + 1) * (attempt + 1))
                         self.stateQueue.asyncAfter(deadline: .now() + delay) { [weak self] in
                             guard let self, !self.disposed else { return }
@@ -464,12 +565,34 @@ public final class TraceClient: NSObject {
                     }
                     self.sending = false
                     self.pausedUntil = Date().addingTimeInterval(30)
+                    self.recordDiagnostic("retry", reason: "retry_exhausted", count: batch.count, status: status ?? 0)
                     self.resolveWaiters(result: false)
                     self.schedulePump(after: 30)
                     return
                 }
 
-                // 2xx is accepted; 4xx other than 429 is a permanent refusal and must not loop.
+                // Successful responses carry accepted/dropped counts; permanent refusals are final.
+                if let status, (200..<300).contains(status) {
+                    let result = data.flatMap { try? JSONDecoder().decode(IngestResponse.self, from: $0) }
+                    let accepted: Int
+                    let dropped: Int
+                    if let result, result.accepted >= 0, result.dropped >= 0,
+                       result.accepted <= batch.count, result.dropped == batch.count - result.accepted {
+                        accepted = result.accepted
+                        dropped = result.dropped
+                    } else {
+                        accepted = batch.count
+                        dropped = 0
+                    }
+                    if accepted > 0 { self.recordDiagnostic("accepted", count: accepted, status: status) }
+                    if dropped > 0 {
+                        self.diagnosticState.increment("dropped", by: dropped, status: status)
+                        self.recordDiagnostic("rejected", reason: "server_dropped", count: dropped, status: status)
+                    }
+                } else {
+                    self.recordDiagnostic("rejected", reason: "http_refusal", count: batch.count, status: status ?? 0)
+                    self.recordDiagnostic("dropped", reason: "http_refusal", count: batch.count, status: status ?? 0)
+                }
                 self.removeRecords(count: batch.count)
                 self.sending = false
                 self.pump()
@@ -496,6 +619,7 @@ public final class TraceClient: NSObject {
             queueBytes -= records.prefix(amount).reduce(0) { $0 + $1.event.count }
             records.removeFirst(amount)
             persistQueue()
+            diagnosticState.setQueueSize(records.count)
         }
     }
 
@@ -729,6 +853,21 @@ public final class TraceClient: NSObject {
 
     private static func isLowercaseHex<S: StringProtocol>(_ value: S) -> Bool {
         value.allSatisfy { ($0 >= "0" && $0 <= "9") || ($0 >= "a" && $0 <= "f") }
+    }
+}
+
+private struct IngestResponse: Decodable {
+    let accepted: Int
+    let dropped: Int
+}
+
+private struct ActiveSession {
+    let sid: String
+    let start: Double
+    var errored: Bool
+
+    var payload: [String: Any] {
+        ["type": "session", "sid": sid, "status": errored ? "errored" : "ok", "start": start]
     }
 }
 
